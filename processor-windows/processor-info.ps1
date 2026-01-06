@@ -220,25 +220,272 @@ else {
 $isPowerShell7 = $PSVersionTable.PSVersion.Major -ge 7
 $powerShellVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"
 
-# Display warning if not using PowerShell 7+
+# ============================================================================
+# FUNCTION: Get-PS7Path
+# ============================================================================
+# Purpose: Detects if PowerShell 7 (pwsh.exe) is installed and returns path
+# Returns: Path to pwsh.exe if found, $null otherwise
+# ============================================================================
+function Get-PS7Path {
+    [CmdletBinding()]
+    param()
+
+    # Check common installation paths first
+    $commonPaths = @(
+        "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+        "${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe"
+        "$env:LOCALAPPDATA\Microsoft\PowerShell\pwsh.exe"
+    )
+
+    foreach ($path in $commonPaths) {
+        if (Test-Path -Path $path -PathType Leaf) {
+            return $path
+        }
+    }
+
+    # If not found in common paths, check PATH environment variable
+    $pwshCmd = Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
+    if ($pwshCmd) {
+        return $pwshCmd.Source
+    }
+
+    return $null
+}
+
+# ============================================================================
+# FUNCTION: Invoke-PS7Command
+# ============================================================================
+# Purpose: Executes a ScriptBlock in PowerShell 7 from PowerShell 5
+# Parameters:
+#   - ScriptBlock: The code to execute in PowerShell 7
+#   - Parameters: Hashtable of named parameters to pass
+#   - ArgumentList: Array of positional arguments
+#   - NoThrow: Return result object instead of throwing on error
+# Returns: Script output (or result object if NoThrow is specified)
+# ============================================================================
+# This function enables PowerShell 5 scripts to leverage PowerShell 7 features
+# (like .NET 5+ CPUID intrinsics) by executing code blocks in pwsh.exe and
+# returning results via JSON serialization.
+# ============================================================================
+function Invoke-PS7Command {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ScriptBlock]$ScriptBlock,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Parameters,
+
+        [Parameter(Mandatory = $false)]
+        [object[]]$ArgumentList,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$NoThrow
+    )
+
+    #region PS7 Detection
+    $pwshPath = Get-PS7Path
+
+    # Error if PS7 not found
+    if (-not $pwshPath) {
+        $errorMsg = "PowerShell 7 (pwsh.exe) not found. Please install PowerShell 7 from https://github.com/PowerShell/PowerShell/releases"
+        if ($NoThrow) {
+            return [PSCustomObject]@{
+                Success = $false
+                Output  = $null
+                Error   = $errorMsg
+            }
+        }
+        throw $errorMsg
+    }
+    #endregion
+
+    #region Build PS7 Command
+    $scriptString = $ScriptBlock.ToString()
+
+    # Encode script and parameters as Base64 to avoid escaping issues
+    $scriptBytes = [System.Text.Encoding]::UTF8.GetBytes($scriptString)
+    $scriptBase64 = [Convert]::ToBase64String($scriptBytes)
+
+    $paramBase64 = 'bnVsbA=='  # 'null' in base64
+    $argsBase64 = 'bnVsbA=='   # 'null' in base64
+
+    if ($Parameters) {
+        $paramJson = $Parameters | ConvertTo-Json -Compress -Depth 10
+        $paramBytes = [System.Text.Encoding]::UTF8.GetBytes($paramJson)
+        $paramBase64 = [Convert]::ToBase64String($paramBytes)
+    }
+
+    if ($ArgumentList) {
+        $argsJson = ConvertTo-Json -InputObject $ArgumentList -Compress -Depth 10
+        $argsBytes = [System.Text.Encoding]::UTF8.GetBytes($argsJson)
+        $argsBase64 = [Convert]::ToBase64String($argsBytes)
+    }
+
+    # Build the wrapper script that runs in PS7
+    $wrapperScript = @"
+`$ErrorActionPreference = 'Stop'
+`$VerbosePreference = 'SilentlyContinue'
+`$WarningPreference = 'SilentlyContinue'
+`$InformationPreference = 'SilentlyContinue'
+`$DebugPreference = 'SilentlyContinue'
+`$result = @{ Success = `$true; Output = `$null; Error = `$null }
+
+try {
+    # Decode Base64 encoded script and parameters
+    `$scriptText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$scriptBase64'))
+    `$sb = [ScriptBlock]::Create(`$scriptText)
+
+    `$paramJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$paramBase64'))
+    `$argsJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$argsBase64'))
+
+    `$splatParams = @{}
+    `$positionalArgs = @()
+
+    if (`$paramJson -ne 'null') {
+        `$params = `$paramJson | ConvertFrom-Json -AsHashtable
+        foreach (`$key in `$params.Keys) {
+            `$splatParams[`$key] = `$params[`$key]
+        }
+    }
+
+    if (`$argsJson -ne 'null') {
+        `$positionalArgs = @(`$argsJson | ConvertFrom-Json)
+    }
+
+    # Execute the scriptblock with parameters (suppress all output streams)
+    if (`$splatParams.Count -gt 0 -and `$positionalArgs.Count -gt 0) {
+        `$result.Output = & `$sb @splatParams @positionalArgs 6>`$null 5>`$null 4>`$null 3>`$null 2>`$null
+    }
+    elseif (`$splatParams.Count -gt 0) {
+        `$result.Output = & `$sb @splatParams 6>`$null 5>`$null 4>`$null 3>`$null 2>`$null
+    }
+    elseif (`$positionalArgs.Count -gt 0) {
+        `$result.Output = & `$sb @positionalArgs 6>`$null 5>`$null 4>`$null 3>`$null 2>`$null
+    }
+    else {
+        `$result.Output = & `$sb 6>`$null 5>`$null 4>`$null 3>`$null 2>`$null
+    }
+}
+catch {
+    `$result.Success = `$false
+    `$result.Error = `$_.Exception.Message + ' | ' + `$_.ScriptStackTrace
+}
+
+# Ensure we only output JSON
+try {
+    `$result | ConvertTo-Json -Depth 10 -Compress
+}
+catch {
+    @{ Success = `$false; Output = `$null; Error = \"JSON serialization failed: `$(`$_.Exception.Message)\" } | ConvertTo-Json -Compress
+}
+"@
+    #endregion
+
+    #region Execute and Handle Results
+    try {
+        $ps7Output = & $pwshPath -NoProfile -NonInteractive -Command $wrapperScript 2>&1
+
+        # Separate stdout from stderr
+        $stdout = $ps7Output | Where-Object { $_ -is [string] -or $_.GetType().Name -eq 'String' }
+        $stderr = $ps7Output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }
+
+        # Get the JSON result (last line of output)
+        $jsonString = ($stdout | Out-String).Trim()
+
+        if (-not $jsonString) {
+            $errorMsg = "No output received from PowerShell 7"
+            if ($stderr) {
+                $errorMsg += ". Errors: " + ($stderr | Out-String)
+            }
+            throw $errorMsg
+        }
+
+        # Try to parse JSON with error handling
+        try {
+            $resultObject = $jsonString | ConvertFrom-Json
+        }
+        catch {
+            $parseError = "Failed to parse PS7 JSON output. Error: $($_.Exception.Message)`nRaw output (first 500 chars): $($jsonString.Substring(0, [Math]::Min(500, $jsonString.Length)))"
+            if ($NoThrow) {
+                return [PSCustomObject]@{
+                    Success = $false
+                    Output  = $null
+                    Error   = $parseError
+                }
+            }
+            throw $parseError
+        }
+
+        if ($resultObject.Success) {
+            if ($NoThrow) {
+                return [PSCustomObject]@{
+                    Success = $true
+                    Output  = $resultObject.Output
+                    Error   = $null
+                }
+            }
+            return $resultObject.Output
+        }
+        else {
+            if ($NoThrow) {
+                return [PSCustomObject]@{
+                    Success = $false
+                    Output  = $null
+                    Error   = $resultObject.Error
+                }
+            }
+            throw "PS7 Error: $($resultObject.Error)"
+        }
+    }
+    catch {
+        if ($NoThrow) {
+            return [PSCustomObject]@{
+                Success = $false
+                Output  = $null
+                Error   = $_.Exception.Message
+            }
+        }
+        throw
+    }
+    #endregion
+}
+
+# ============================================================================
+# Check if PowerShell 7 is available for use (even if currently in PS5)
+# ============================================================================
+$ps7Available = $null -ne (Get-PS7Path)
+$usingPS7Wrapper = $false
+
+# Display warning if not using PowerShell 7+ directly
 if (-not $isPowerShell7) {
-    Write-Output ""
-    Write-Output "========================================================================"
-    Write-Output "WARNING! Microsoft PowerShell 7.x is not installed."
-    Write-Output "Current version: PowerShell $powerShellVersion"
-    Write-Output ""
-    Write-Output "This script will continue running with fallback detection methods:"
-    Write-Output "  - Windows API (IsProcessorFeaturePresent) - Limited feature support"
-    Write-Output "  - Registry parsing - May not contain all features"
-    Write-Output "  - Model-based detection - Makes assumptions based on CPU name"
-    Write-Output ""
-    Write-Output "⚠ WARNING: Results may not be completely accurate, especially in VMs!"
-    Write-Output ""
-    Write-Output "RECOMMENDATION: Install PowerShell 7 for accurate hardware detection"
-    Write-Output "  Download: https://aka.ms/powershell"
-    Write-Output "  Or run: winget install Microsoft.PowerShell"
-    Write-Output "========================================================================"
-    Write-Output ""
+    if ($ps7Available) {
+        Write-Output ""
+        Write-Output "========================================================================"
+        Write-Output "INFO: Running in PowerShell $powerShellVersion, but PowerShell 7 is available."
+        Write-Output "Using PS7 wrapper for accurate CPUID hardware detection."
+        Write-Output "========================================================================"
+        Write-Output ""
+        $usingPS7Wrapper = $true
+    } else {
+        Write-Output ""
+        Write-Output "========================================================================"
+        Write-Output "WARNING! Microsoft PowerShell 7.x is not installed."
+        Write-Output "Current version: PowerShell $powerShellVersion"
+        Write-Output ""
+        Write-Output "This script will continue running with fallback detection methods:"
+        Write-Output "  - Windows API (IsProcessorFeaturePresent) - Limited feature support"
+        Write-Output "  - Registry parsing - May not contain all features"
+        Write-Output "  - Model-based detection - Makes assumptions based on CPU name"
+        Write-Output ""
+        Write-Output "WARNING: Results may not be completely accurate, especially in VMs!"
+        Write-Output ""
+        Write-Output "RECOMMENDATION: Install PowerShell 7 for accurate hardware detection"
+        Write-Output "  Download: https://aka.ms/powershell"
+        Write-Output "  Or run: winget install Microsoft.PowerShell"
+        Write-Output "========================================================================"
+        Write-Output ""
+    }
 }
 
 # ============================================================================
@@ -436,11 +683,25 @@ $cpuFeatureDefinitions = [ordered]@{
     "64-bit" = "64-bit Long Mode"
     "VMX" = "VMX (Intel Virtualization)"
     "SVM" = "SVM (AMD Virtualization)"
-    "Hypervisor" = "Running under Hypervisor"
+    "Hypervisor" = "Running under Hypervisor *"
 }
 
 # Initialize hashtable to store detected CPU features
+# Each feature will have: Supported (bool/string) and Enabled (bool/string/null for N/A)
 $cpuFeatures = @{}
+
+# Track enabled status separately for features that can be enabled/disabled
+# Features not in this hashtable will show "N/A" in the Enabled column
+$cpuFeaturesEnabled = @{}
+
+# Define which features can have an enabled/disabled status
+# These are features that can be turned on/off in BIOS or OS settings
+$featureCanBeDisabled = @(
+    "VMX",           # Intel VT-x - can be disabled in BIOS
+    "SVM",           # AMD-V - can be disabled in BIOS
+    "Hypervisor",    # Hypervisor/Hyper-V - can be enabled/disabled in Windows
+    "NX"             # DEP/NX - can be configured in Windows (though typically always on)
+)
 
 # ============================================================================
 # CPU FEATURE DETECTION - METHOD 1: .NET 5+ CPUID INTRINSICS (MOST ACCURATE)
@@ -448,96 +709,149 @@ $cpuFeatures = @{}
 # PowerShell 7+ running on .NET 5+ provides direct access to CPUID instructions
 # via System.Runtime.Intrinsics.X86.X86Base. This is the most reliable method
 # as it queries the CPU hardware directly.
+#
+# If running in PowerShell 5 but PowerShell 7 is available, we use the
+# Invoke-PS7Command wrapper to execute the CPUID detection in PS7.
 # ============================================================================
 $cpuidViaIntrinsics = $false
-try {
-    # Check if System.Runtime.Intrinsics.X86 namespace is available
-    $x86BaseType = [System.Runtime.Intrinsics.X86.X86Base] -as [Type]
 
-    if ($null -ne $x86BaseType -and $x86BaseType::IsSupported) {
-        Write-Verbose "Using .NET 5+ CPU intrinsics for CPUID detection"
+# Define the CPUID detection script block (used both natively and via wrapper)
+$cpuidDetectionScriptBlock = {
+    $features = @{}
+    $success = $false
 
-        # ====================================================================
-        # CPUID Function 1: Standard Feature Information
-        # ====================================================================
-        # EAX=1 returns version info in EAX and feature flags in ECX/EDX
-        # ====================================================================
-        $eax = 1
-        $ecx = 0
-        $cpuidResult = $x86BaseType::CpuId($eax, $ecx)
-        $ecx1 = $cpuidResult.Ecx  # Feature flags (newer features)
-        $edx1 = $cpuidResult.Edx  # Feature flags (older features)
+    try {
+        # Check if System.Runtime.Intrinsics.X86 namespace is available
+        $x86BaseType = [System.Runtime.Intrinsics.X86.X86Base] -as [Type]
 
-        # ====================================================================
-        # Parse ECX register bits (CPUID.01H:ECX)
-        # Each bit indicates support for a specific CPU feature
-        # ====================================================================
-        if ($ecx1 -band (1 -shl 0)) { $cpuFeatures["SSE3"] = "supported" }       # Bit 0: SSE3
-        if ($ecx1 -band (1 -shl 1)) { $cpuFeatures["PCLMULQDQ"] = "supported" }  # Bit 1: PCLMULQDQ
-        if ($ecx1 -band (1 -shl 9)) { $cpuFeatures["SSSE3"] = "supported" }      # Bit 9: SSSE3
-        if ($ecx1 -band (1 -shl 12)) { $cpuFeatures["FMA"] = "supported" }       # Bit 12: FMA
-        if ($ecx1 -band (1 -shl 19)) { $cpuFeatures["SSE4.1"] = "supported" }    # Bit 19: SSE4.1
-        if ($ecx1 -band (1 -shl 20)) { $cpuFeatures["SSE4.2"] = "supported" }    # Bit 20: SSE4.2
-        if ($ecx1 -band (1 -shl 22)) { $cpuFeatures["MOVBE"] = "supported" }     # Bit 22: MOVBE
-        if ($ecx1 -band (1 -shl 23)) { $cpuFeatures["POPCNT"] = "supported" }    # Bit 23: POPCNT
-        if ($ecx1 -band (1 -shl 25)) { $cpuFeatures["AES"] = "supported" }       # Bit 25: AES-NI
-        if ($ecx1 -band (1 -shl 26)) { $cpuFeatures["XSAVE"] = "supported" }     # Bit 26: XSAVE
-        if ($ecx1 -band (1 -shl 28)) { $cpuFeatures["AVX"] = "supported" }       # Bit 28: AVX
-        if ($ecx1 -band (1 -shl 29)) { $cpuFeatures["F16C"] = "supported" }      # Bit 29: F16C
-        if ($ecx1 -band (1 -shl 30)) { $cpuFeatures["RDRAND"] = "supported" }    # Bit 30: RDRAND
+        if ($null -ne $x86BaseType -and $x86BaseType::IsSupported) {
+            # ====================================================================
+            # CPUID Function 1: Standard Feature Information
+            # ====================================================================
+            $cpuidResult = $x86BaseType::CpuId(1, 0)
+            $ecx1 = $cpuidResult.Ecx
+            $edx1 = $cpuidResult.Edx
 
-        # ====================================================================
-        # Parse EDX register bits (CPUID.01H:EDX)
-        # ====================================================================
-        if ($edx1 -band (1 -shl 25)) { $cpuFeatures["SSE"] = "supported" }       # Bit 25: SSE
-        if ($edx1 -band (1 -shl 26)) { $cpuFeatures["SSE2"] = "supported" }      # Bit 26: SSE2
+            # Parse ECX register bits (CPUID.01H:ECX)
+            if ($ecx1 -band (1 -shl 0)) { $features["SSE3"] = "supported" }
+            if ($ecx1 -band (1 -shl 1)) { $features["PCLMULQDQ"] = "supported" }
+            if ($ecx1 -band (1 -shl 9)) { $features["SSSE3"] = "supported" }
+            if ($ecx1 -band (1 -shl 12)) { $features["FMA"] = "supported" }
+            if ($ecx1 -band (1 -shl 19)) { $features["SSE4.1"] = "supported" }
+            if ($ecx1 -band (1 -shl 20)) { $features["SSE4.2"] = "supported" }
+            if ($ecx1 -band (1 -shl 22)) { $features["MOVBE"] = "supported" }
+            if ($ecx1 -band (1 -shl 23)) { $features["POPCNT"] = "supported" }
+            if ($ecx1 -band (1 -shl 25)) { $features["AES"] = "supported" }
+            if ($ecx1 -band (1 -shl 26)) { $features["XSAVE"] = "supported" }
+            if ($ecx1 -band (1 -shl 28)) { $features["AVX"] = "supported" }
+            if ($ecx1 -band (1 -shl 29)) { $features["F16C"] = "supported" }
+            if ($ecx1 -band (1 -shl 30)) { $features["RDRAND"] = "supported" }
 
-        # ====================================================================
-        # CPUID Function 7: Extended Features
-        # ====================================================================
-        # EAX=7, ECX=0 returns extended feature flags
-        # ====================================================================
-        $cpuidResult7 = $x86BaseType::CpuId(7, 0)
-        $ebx7 = $cpuidResult7.Ebx  # Extended feature flags
-        $ecx7 = $cpuidResult7.Ecx  # More extended feature flags
+            # Parse EDX register bits (CPUID.01H:EDX)
+            if ($edx1 -band (1 -shl 25)) { $features["SSE"] = "supported" }
+            if ($edx1 -band (1 -shl 26)) { $features["SSE2"] = "supported" }
 
-        # ====================================================================
-        # Parse EBX register bits (CPUID.07H:EBX)
-        # ====================================================================
-        if ($ebx7 -band (1 -shl 3)) { $cpuFeatures["BMI1"] = "supported" }       # Bit 3: BMI1
-        if ($ebx7 -band (1 -shl 5)) { $cpuFeatures["AVX2"] = "supported" }       # Bit 5: AVX2
-        if ($ebx7 -band (1 -shl 8)) { $cpuFeatures["BMI2"] = "supported" }       # Bit 8: BMI2
-        if ($ebx7 -band (1 -shl 16)) { $cpuFeatures["AVX-512"] = "supported" }   # Bit 16: AVX-512F
-        if ($ebx7 -band (1 -shl 19)) { $cpuFeatures["ADX"] = "supported" }       # Bit 19: ADX
-        if ($ebx7 -band (1 -shl 18)) { $cpuFeatures["RDSEED"] = "supported" }    # Bit 18: RDSEED
-        if ($ebx7 -band (1 -shl 29)) { $cpuFeatures["SHA"] = "supported" }       # Bit 29: SHA
+            # ====================================================================
+            # CPUID Function 7: Extended Features
+            # ====================================================================
+            $cpuidResult7 = $x86BaseType::CpuId(7, 0)
+            $ebx7 = $cpuidResult7.Ebx
 
-        # ====================================================================
-        # CPUID Extended Function 0x80000001: Extended Processor Info
-        # ====================================================================
-        # AMD-specific and extended features
-        # ====================================================================
-        $cpuidResultExt = $x86BaseType::CpuId([int]0x80000001, 0)
-        $ecxExt = $cpuidResultExt.Ecx
-        $edxExt = $cpuidResultExt.Edx
+            # Parse EBX register bits (CPUID.07H:EBX)
+            if ($ebx7 -band (1 -shl 3)) { $features["BMI1"] = "supported" }
+            if ($ebx7 -band (1 -shl 5)) { $features["AVX2"] = "supported" }
+            if ($ebx7 -band (1 -shl 8)) { $features["BMI2"] = "supported" }
+            if ($ebx7 -band (1 -shl 16)) { $features["AVX-512"] = "supported" }
+            if ($ebx7 -band (1 -shl 18)) { $features["RDSEED"] = "supported" }
+            if ($ebx7 -band (1 -shl 19)) { $features["ADX"] = "supported" }
+            if ($ebx7 -band (1 -shl 29)) { $features["SHA"] = "supported" }
 
-        # Parse ECX register (CPUID.80000001H:ECX)
-        if ($ecxExt -band (1 -shl 5)) { $cpuFeatures["LZCNT"] = "supported" }    # Bit 5: LZCNT
+            # ====================================================================
+            # CPUID Extended Function 0x80000001: Extended Processor Info
+            # ====================================================================
+            $cpuidResultExt = $x86BaseType::CpuId([int]0x80000001, 0)
+            $ecxExt = $cpuidResultExt.Ecx
+            $edxExt = $cpuidResultExt.Edx
 
-        # Parse EDX register (CPUID.80000001H:EDX)
-        if ($edxExt -band (1 -shl 11)) { $cpuFeatures["SYSCALL"] = "supported" } # Bit 11: SYSCALL
-        if ($edxExt -band (1 -shl 20)) { $cpuFeatures["NX"] = "supported" }      # Bit 20: NX bit
-        if ($edxExt -band (1 -shl 26)) { $cpuFeatures["1GB Pages"] = "supported" } # Bit 26: 1GB pages
-        if ($edxExt -band (1 -shl 27)) { $cpuFeatures["RDTSCP"] = "supported" }  # Bit 27: RDTSCP
-        if ($edxExt -band (1 -shl 29)) { $cpuFeatures["64-bit"] = "supported" }  # Bit 29: Long mode
+            # Parse ECX register (CPUID.80000001H:ECX)
+            if ($ecxExt -band (1 -shl 5)) { $features["LZCNT"] = "supported" }
 
-        $cpuidViaIntrinsics = $true
-        Write-Output "✓ Using DYNAMIC detection: .NET 5+ CPUID intrinsics (hardware query)"
+            # Parse EDX register (CPUID.80000001H:EDX)
+            if ($edxExt -band (1 -shl 11)) { $features["SYSCALL"] = "supported" }
+            if ($edxExt -band (1 -shl 20)) { $features["NX"] = "supported" }
+            if ($edxExt -band (1 -shl 26)) { $features["1GB Pages"] = "supported" }
+            if ($edxExt -band (1 -shl 27)) { $features["RDTSCP"] = "supported" }
+            if ($edxExt -band (1 -shl 29)) { $features["64-bit"] = "supported" }
+
+            $success = $true
+        }
+    }
+    catch {
+        $success = $false
+    }
+
+    return [PSCustomObject]@{
+        Success = $success
+        Features = $features
     }
 }
-catch {
-    Write-Output "⚠ .NET 5+ intrinsics not available - using fallback methods"
-    Write-Output "  → Recommendation: Install PowerShell 7+ for accurate hardware detection"
+
+# Attempt CPUID detection - either natively (PS7) or via wrapper (PS5 + PS7 available)
+if ($isPowerShell7) {
+    # Running natively in PowerShell 7 - execute directly
+    try {
+        $cpuidResult = & $cpuidDetectionScriptBlock
+
+        if ($cpuidResult.Success) {
+            # Copy detected features to main hashtable
+            foreach ($key in $cpuidResult.Features.Keys) {
+                $cpuFeatures[$key] = $cpuidResult.Features[$key]
+            }
+            $cpuidViaIntrinsics = $true
+            Write-Output "Using DYNAMIC detection: .NET 5+ CPUID intrinsics (hardware query, native PS7)"
+        }
+    }
+    catch {
+        Write-Output ".NET 5+ intrinsics failed in native PS7 - using fallback methods"
+    }
+}
+elseif ($usingPS7Wrapper) {
+    # Running in PowerShell 5 but PS7 is available - use wrapper
+    try {
+        $cpuidResult = Invoke-PS7Command -ScriptBlock $cpuidDetectionScriptBlock -NoThrow
+
+        if ($cpuidResult.Success -and $cpuidResult.Output.Success) {
+            # Copy detected features from PS7 result to main hashtable
+            $ps7Features = $cpuidResult.Output.Features
+            if ($ps7Features -is [PSCustomObject]) {
+                # Convert PSCustomObject to hashtable
+                $ps7Features.PSObject.Properties | ForEach-Object {
+                    $cpuFeatures[$_.Name] = $_.Value
+                }
+            }
+            elseif ($ps7Features -is [hashtable]) {
+                foreach ($key in $ps7Features.Keys) {
+                    $cpuFeatures[$key] = $ps7Features[$key]
+                }
+            }
+            $cpuidViaIntrinsics = $true
+            Write-Output "Using DYNAMIC detection: .NET 5+ CPUID intrinsics (hardware query via PS7 wrapper)"
+        }
+        else {
+            $errorMsg = if ($cpuidResult.Error) { $cpuidResult.Error } else { "Unknown error" }
+            Write-Output "PS7 wrapper CPUID detection failed: $errorMsg"
+            Write-Output "Falling back to alternative detection methods..."
+        }
+    }
+    catch {
+        Write-Output "PS7 wrapper invocation failed: $_"
+        Write-Output "Falling back to alternative detection methods..."
+    }
+}
+else {
+    # No PS7 available at all - will use fallback methods below
+    Write-Output ".NET 5+ intrinsics not available - using fallback methods"
+    Write-Output "  Recommendation: Install PowerShell 7+ for accurate hardware detection"
 }
 
 # ============================================================================
@@ -573,13 +887,19 @@ if (Test-Path $cpuidPath) {
     # ========================================================================
     # Check Win32_Processor properties for basic features
     # ========================================================================
+    # NOTE: WMI properties can be unreliable, especially on 64-bit systems.
+    # We only set "supported" when positively detected here. The model-based
+    # inference will handle modern CPUs that WMI fails to detect properly.
+    # ========================================================================
 
     # PAE (Physical Address Extension) support
-    if ($processor.PAEEnabled) {
+    # Note: PAEEnabled indicates if PAE mode is active, not if CPU supports it.
+    # All x64 CPUs support PAE (it's required for 64-bit mode).
+    # Only set "supported" here; model-based inference handles the rest.
+    if ($processor.PAEEnabled -eq $true) {
         $cpuFeatures["PAE"] = "supported"
-    } else {
-        $cpuFeatures["PAE"] = "not_supported"
     }
+    # Don't set "not_supported" - WMI is unreliable for this on x64 systems
 
     # 64-bit support (we already verified x64 architecture)
     $cpuFeatures["64-bit"] = "supported"
@@ -587,18 +907,41 @@ if (Test-Path $cpuidPath) {
     # ========================================================================
     # Virtualization support detection (Intel VT-x or AMD-V)
     # ========================================================================
-    if ($processor.VirtualizationFirmwareEnabled -or $processor.VMMonitorModeExtensions) {
-        # Set appropriate virtualization feature based on vendor
-        if ($cpuVendor -match "Intel") {
-            $cpuFeatures["VMX"] = "supported"       # Intel VT-x
-            $cpuFeatures["SVM"] = "not_supported"
-        } elseif ($cpuVendor -match "AMD") {
-            $cpuFeatures["SVM"] = "supported"       # AMD-V
-            $cpuFeatures["VMX"] = "not_supported"
+    # VirtualizationFirmwareEnabled = VT-x/AMD-V is enabled in BIOS AND Windows
+    # VMMonitorModeExtensions = CPU supports virtualization extensions
+    #
+    # NOTE: If VT-x/AMD-V is disabled in BIOS, VirtualizationFirmwareEnabled
+    # will be false even though the CPU SUPPORTS it. All modern Intel/AMD
+    # CPUs support virtualization - it might just be disabled.
+    # We track both: support (from model-based inference) and enabled status (from WMI).
+    # ========================================================================
+    $virtEnabled = $processor.VirtualizationFirmwareEnabled -eq $true
+    $virtSupported = $processor.VMMonitorModeExtensions -eq $true
+
+    if ($cpuVendor -match "Intel") {
+        # Track enabled status for VMX
+        if ($virtEnabled) {
+            $cpuFeatures["VMX"] = "supported"
+            $cpuFeaturesEnabled["VMX"] = "enabled"
+        } elseif ($virtSupported) {
+            # CPU supports it but it's not enabled (likely disabled in BIOS)
+            $cpuFeatures["VMX"] = "supported"
+            $cpuFeaturesEnabled["VMX"] = "disabled"
+        } else {
+            # WMI can't confirm - leave for model-based inference but mark as disabled
+            $cpuFeaturesEnabled["VMX"] = "disabled"
         }
-    } else {
-        $cpuFeatures["VMX"] = "not_supported"
-        $cpuFeatures["SVM"] = "not_supported"
+    } elseif ($cpuVendor -match "AMD") {
+        # Track enabled status for SVM
+        if ($virtEnabled) {
+            $cpuFeatures["SVM"] = "supported"
+            $cpuFeaturesEnabled["SVM"] = "enabled"
+        } elseif ($virtSupported) {
+            $cpuFeatures["SVM"] = "supported"
+            $cpuFeaturesEnabled["SVM"] = "disabled"
+        } else {
+            $cpuFeaturesEnabled["SVM"] = "disabled"
+        }
     }
 
     # ========================================================================
@@ -608,21 +951,29 @@ if (Test-Path $cpuidPath) {
         $hypervisorPresent = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent
         if ($hypervisorPresent) {
             $cpuFeatures["Hypervisor"] = "supported"
+            $cpuFeaturesEnabled["Hypervisor"] = "enabled"
         } else {
             $cpuFeatures["Hypervisor"] = "not_supported"
+            $cpuFeaturesEnabled["Hypervisor"] = "disabled"
         }
     }
     catch {
-        $cpuFeatures["Hypervisor"] = "not_supported"
+        # Can't determine - leave unset for model-based inference
     }
 
     # ========================================================================
     # NX/XD bit (No-Execute / Execute Disable) for DEP support
     # ========================================================================
-    if ($processor.DataExecutionPrevention_Available) {
+    # DataExecutionPrevention_Available indicates DEP is available AND enabled.
+    # All x64 CPUs support NX (required for Windows 8+).
+    # We track both support (always true for x64) and enabled status.
+    # ========================================================================
+    if ($processor.DataExecutionPrevention_Available -eq $true) {
         $cpuFeatures["NX"] = "supported"
+        $cpuFeaturesEnabled["NX"] = "enabled"
     } else {
-        $cpuFeatures["NX"] = "not_supported"
+        # NX is supported on all x64 CPUs but might be disabled in Windows settings
+        $cpuFeaturesEnabled["NX"] = "disabled"
     }
 }
 
@@ -825,6 +1176,63 @@ $vulnerabilities = @{}
 $unmitigatedVulns = 0
 
 # ============================================================================
+# VULNERABILITY METADATA
+# ============================================================================
+# Reference information for each vulnerability including CVE numbers,
+# disclosure dates, and Microsoft guidance articles.
+# ============================================================================
+$vulnerabilityMetadata = @{
+    "Spectre Variant 1 (Bounds Check Bypass)" = @{
+        CVE = "CVE-2017-5753"
+        Date = "2018-01-03"
+        MSArticle = "https://support.microsoft.com/en-us/help/4073119"
+        Description = "Bounds Check Bypass"
+    }
+    "Spectre Variant 2 (Branch Target Injection)" = @{
+        CVE = "CVE-2017-5715"
+        Date = "2018-01-03"
+        MSArticle = "https://support.microsoft.com/en-us/help/4073119"
+        Description = "Branch Target Injection"
+    }
+    "Meltdown (Rogue Data Cache Load)" = @{
+        CVE = "CVE-2017-5754"
+        Date = "2018-01-03"
+        MSArticle = "https://support.microsoft.com/en-us/help/4073119"
+        Description = "Rogue Data Cache Load"
+    }
+    "Spectre Variant 4 (Speculative Store Bypass)" = @{
+        CVE = "CVE-2018-3639"
+        Date = "2018-05-21"
+        MSArticle = "https://support.microsoft.com/en-us/help/4073119"
+        Description = "Speculative Store Bypass"
+    }
+    "L1TF (L1 Terminal Fault / Foreshadow)" = @{
+        CVE = "CVE-2018-3615, CVE-2018-3620, CVE-2018-3646"
+        Date = "2018-08-14"
+        MSArticle = "https://support.microsoft.com/en-us/help/4457951"
+        Description = "L1 Terminal Fault affecting SGX, OS, and VMM"
+    }
+    "MDS (Microarchitectural Data Sampling)" = @{
+        CVE = "CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091"
+        Date = "2019-05-14"
+        MSArticle = "https://support.microsoft.com/en-us/help/4093836"
+        Description = "MSBDS (Fallout), MFBDS (ZombieLoad), MLPDS, MDSUM"
+    }
+    "TAA (TSX Asynchronous Abort)" = @{
+        CVE = "CVE-2019-11135"
+        Date = "2019-11-12"
+        MSArticle = "https://support.microsoft.com/en-us/help/4072698"
+        Description = "TSX Asynchronous Abort affecting Intel CPUs with TSX"
+    }
+    "SBDR/SBDS (Shared Buffers Data Sampling)" = @{
+        CVE = "CVE-2022-21123, CVE-2022-21125"
+        Date = "2022-06-14"
+        MSArticle = "https://support.microsoft.com/en-us/help/5019180"
+        Description = "MMIO Stale Data vulnerabilities"
+    }
+}
+
+# ============================================================================
 # Import SpeculationControl module for vulnerability checking
 # ============================================================================
 # The module was checked/installed at script start
@@ -861,13 +1269,18 @@ if ($speculationControlAvailable) {
                         Mitigation = "Software mitigations only"
                     }
                 }
+            } else {
+                $vulnerabilities["Spectre Variant 1 (Bounds Check Bypass)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
+                }
             }
 
             # ================================================================
             # Spectre Variant 2 (Branch Target Injection) - CVE-2017-5715
             # ================================================================
-            if ($null -ne $specControl.BTIWindowsSupportPresent -and $null -ne $specControl.BTIWindowsSupportEnabled) {
-                if ($specControl.BTIWindowsSupportEnabled) {
+            if ($null -ne $specControl.BTIWindowsSupportPresent -or $null -ne $specControl.BTIWindowsSupportEnabled) {
+                if ($specControl.BTIWindowsSupportEnabled -eq $true) {
                     $mitigation = "Windows support enabled"
                     if ($specControl.BTIHardwarePresent) {
                         $mitigation += ", hardware support present"
@@ -883,35 +1296,138 @@ if ($speculationControlAvailable) {
                     }
                     $unmitigatedVulns++
                 }
+            } else {
+                $vulnerabilities["Spectre Variant 2 (Branch Target Injection)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
+                }
+            }
+
+            # ================================================================
+            # Meltdown (Rogue Data Cache Load) - CVE-2017-5754
+            # ================================================================
+            # KVA Shadow (Kernel Virtual Address Shadow) is Windows' mitigation
+            # for Meltdown, similar to Linux KPTI (Kernel Page Table Isolation)
+            # ================================================================
+            if ($null -ne $specControl.KVAShadowRequired) {
+                if ($specControl.KVAShadowRequired -eq $false) {
+                    # CPU is not affected by Meltdown (e.g., AMD CPUs, newer Intel with hardware fix)
+                    $vulnerabilities["Meltdown (Rogue Data Cache Load)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (hardware not vulnerable)"
+                    }
+                } elseif ($specControl.KVAShadowWindowsSupportEnabled -eq $true) {
+                    # KVA Shadow is enabled
+                    $mitigation = "KVA Shadow enabled"
+                    if ($specControl.KVAShadowPcidEnabled -eq $true) {
+                        $mitigation += ", PCID optimization enabled"
+                    }
+                    $vulnerabilities["Meltdown (Rogue Data Cache Load)"] = @{
+                        Status = "mitigated"
+                        Mitigation = $mitigation
+                    }
+                } elseif ($specControl.KVAShadowWindowsSupportPresent -eq $true) {
+                    # Support present but not enabled
+                    $vulnerabilities["Meltdown (Rogue Data Cache Load)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "KVA Shadow available but not enabled"
+                    }
+                    $unmitigatedVulns++
+                } else {
+                    # Required but no support
+                    $vulnerabilities["Meltdown (Rogue Data Cache Load)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated - KVA Shadow not available"
+                    }
+                    $unmitigatedVulns++
+                }
+            } else {
+                $vulnerabilities["Meltdown (Rogue Data Cache Load)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
+                }
             }
 
             # ================================================================
             # Spectre Variant 4 (Speculative Store Bypass) - CVE-2018-3639
             # ================================================================
-            if ($null -ne $specControl.SSBDWindowsSupportPresent -and $null -ne $specControl.SSBDWindowsSupportEnabled) {
-                if ($specControl.SSBDWindowsSupportEnabled) {
+            if ($null -ne $specControl.SSBDHardwareVulnerable) {
+                if ($specControl.SSBDHardwareVulnerable -eq $false) {
+                    # CPU is not affected
+                    $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (hardware not vulnerable)"
+                    }
+                } elseif ($specControl.SSBDWindowsSupportEnabled -eq $true) {
                     $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
                         Status = "mitigated"
                         Mitigation = "Windows SSBD support enabled"
                     }
+                } elseif ($specControl.SSBDWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "SSBD available but not enabled"
+                    }
+                    $unmitigatedVulns++
                 } else {
                     $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
                         Status = "vulnerable"
                         Mitigation = "Not Mitigated"
                     }
                     $unmitigatedVulns++
+                }
+            } elseif ($null -ne $specControl.SSBDWindowsSupportPresent -or $null -ne $specControl.SSBDWindowsSupportEnabled) {
+                # Fallback if SSBDHardwareVulnerable is not available
+                if ($specControl.SSBDWindowsSupportEnabled -eq $true) {
+                    $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                        Status = "mitigated"
+                        Mitigation = "Windows SSBD support enabled"
+                    }
+                } elseif ($specControl.SSBDWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "SSBD available but not enabled"
+                    }
+                    $unmitigatedVulns++
+                } else {
+                    $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated"
+                    }
+                    $unmitigatedVulns++
+                }
+            } else {
+                $vulnerabilities["Spectre Variant 4 (Speculative Store Bypass)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
                 }
             }
 
             # ================================================================
             # L1TF (L1 Terminal Fault / Foreshadow) - CVE-2018-3615/3620/3646
             # ================================================================
-            if ($null -ne $specControl.L1TFWindowsSupportPresent -and $null -ne $specControl.L1TFWindowsSupportEnabled) {
-                if ($specControl.L1TFWindowsSupportEnabled) {
+            if ($null -ne $specControl.L1TFHardwareVulnerable) {
+                if ($specControl.L1TFHardwareVulnerable -eq $false) {
+                    # CPU is not affected (AMD CPUs, newer Intel)
+                    $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (hardware not vulnerable)"
+                    }
+                } elseif ($specControl.L1TFWindowsSupportEnabled -eq $true) {
+                    $mitigation = "Windows L1TF mitigations enabled"
+                    if ($specControl.L1TFFlushSupported -eq $true) {
+                        $mitigation += ", L1D flush supported"
+                    }
                     $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
                         Status = "mitigated"
-                        Mitigation = "Windows L1TF mitigations enabled"
+                        Mitigation = $mitigation
                     }
+                } elseif ($specControl.L1TFWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "L1TF mitigations available but not enabled"
+                    }
+                    $unmitigatedVulns++
                 } else {
                     $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
                         Status = "vulnerable"
@@ -919,19 +1435,138 @@ if ($speculationControlAvailable) {
                     }
                     $unmitigatedVulns++
                 }
+            } elseif ($null -ne $specControl.L1TFWindowsSupportPresent -or $null -ne $specControl.L1TFWindowsSupportEnabled) {
+                # Fallback if L1TFHardwareVulnerable is not available
+                if ($specControl.L1TFWindowsSupportEnabled -eq $true) {
+                    $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                        Status = "mitigated"
+                        Mitigation = "Windows L1TF mitigations enabled"
+                    }
+                } elseif ($specControl.L1TFWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "L1TF mitigations available but not enabled"
+                    }
+                    $unmitigatedVulns++
+                } else {
+                    $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated"
+                    }
+                    $unmitigatedVulns++
+                }
+            } else {
+                $vulnerabilities["L1TF (L1 Terminal Fault / Foreshadow)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
+                }
             }
 
             # ================================================================
             # MDS (Microarchitectural Data Sampling) - CVE-2018-12126/12127/12130, CVE-2019-11091
+            # Includes MSBDS (Fallout), MFBDS (ZombieLoad), MLPDS, MDSUM
             # ================================================================
-            if ($null -ne $specControl.MDSWindowsSupportPresent -and $null -ne $specControl.MDSWindowsSupportEnabled) {
-                if ($specControl.MDSWindowsSupportEnabled) {
+            if ($null -ne $specControl.MDSHardwareVulnerable) {
+                if ($specControl.MDSHardwareVulnerable -eq $false) {
+                    # CPU is not affected (AMD CPUs, newer Intel with hardware fix)
+                    $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (hardware not vulnerable)"
+                    }
+                } elseif ($specControl.MDSWindowsSupportEnabled -eq $true) {
+                    $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "mitigated"
+                        Mitigation = "Windows MDS mitigations enabled (buffer overwrite on context switch)"
+                    }
+                } elseif ($specControl.MDSWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "MDS mitigations available but not enabled"
+                    }
+                    $unmitigatedVulns++
+                } else {
+                    $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated"
+                    }
+                    $unmitigatedVulns++
+                }
+            } elseif ($null -ne $specControl.MDSWindowsSupportPresent -or $null -ne $specControl.MDSWindowsSupportEnabled) {
+                # Fallback if MDSHardwareVulnerable is not available
+                if ($specControl.MDSWindowsSupportEnabled -eq $true) {
                     $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
                         Status = "mitigated"
                         Mitigation = "Windows MDS mitigations enabled"
                     }
+                } elseif ($specControl.MDSWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "MDS mitigations available but not enabled"
+                    }
+                    $unmitigatedVulns++
                 } else {
                     $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated"
+                    }
+                    $unmitigatedVulns++
+                }
+            } else {
+                $vulnerabilities["MDS (Microarchitectural Data Sampling)"] = @{
+                    Status = "unknown"
+                    Mitigation = "Unable to determine status"
+                }
+            }
+
+            # ================================================================
+            # TAA (TSX Asynchronous Abort) - CVE-2019-11135
+            # Only affects Intel CPUs with TSX (Transactional Synchronization Extensions)
+            # ================================================================
+            if ($null -ne $specControl.TAAHardwareVulnerable) {
+                if ($specControl.TAAHardwareVulnerable -eq $false) {
+                    $vulnerabilities["TAA (TSX Asynchronous Abort)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (TSX disabled or not present)"
+                    }
+                } elseif ($specControl.TAAWindowsSupportEnabled -eq $true) {
+                    $vulnerabilities["TAA (TSX Asynchronous Abort)"] = @{
+                        Status = "mitigated"
+                        Mitigation = "Windows TAA mitigations enabled"
+                    }
+                } elseif ($specControl.TAAWindowsSupportPresent -eq $true) {
+                    $vulnerabilities["TAA (TSX Asynchronous Abort)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "TAA mitigations available but not enabled"
+                    }
+                    $unmitigatedVulns++
+                } else {
+                    $vulnerabilities["TAA (TSX Asynchronous Abort)"] = @{
+                        Status = "vulnerable"
+                        Mitigation = "Not Mitigated"
+                    }
+                    $unmitigatedVulns++
+                }
+            }
+            # Note: If TAAHardwareVulnerable is not present, the CPU likely doesn't have TSX
+            # and is therefore not affected - we don't add an "unknown" entry
+
+            # ================================================================
+            # SBDR/SBDS (Shared Buffers Data Read/Sampling) - CVE-2022-21123/21125
+            # Part of MMIO Stale Data vulnerabilities
+            # ================================================================
+            if ($null -ne $specControl.SBDRSSDPHardwareVulnerable) {
+                if ($specControl.SBDRSSDPHardwareVulnerable -eq $false) {
+                    $vulnerabilities["SBDR/SBDS (Shared Buffers Data Sampling)"] = @{
+                        Status = "not_affected"
+                        Mitigation = "CPU not affected (hardware not vulnerable)"
+                    }
+                } elseif ($specControl.FBClearEnabled -eq $true) {
+                    $vulnerabilities["SBDR/SBDS (Shared Buffers Data Sampling)"] = @{
+                        Status = "mitigated"
+                        Mitigation = "Fill buffer clearing enabled"
+                    }
+                } else {
+                    $vulnerabilities["SBDR/SBDS (Shared Buffers Data Sampling)"] = @{
                         Status = "vulnerable"
                         Mitigation = "Not Mitigated"
                     }
@@ -1002,10 +1637,29 @@ $htmlOutput = @"
 "@
 
 # ============================================================================
-# Add PowerShell 7 warning banner if not using PS7+
+# Add PowerShell version info banner
 # ============================================================================
 if (-not $isPowerShell7) {
-    $htmlOutput += @"
+    if ($usingPS7Wrapper -and $cpuidViaIntrinsics) {
+        # PS5 running but using PS7 wrapper successfully
+        $htmlOutput += @"
+<div style='padding: 15px; margin-bottom: 20px; background-color: #d4edda; border-left: 5px solid #28a745; border-radius: 3px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);'>
+<div style='display: flex; align-items: flex-start;'>
+<div style='font-size: 32px; margin-right: 15px; color: #28a745;'>✓</div>
+<div>
+<strong style='color: #155724; font-size: 16px;'>PowerShell 7 Wrapper Active</strong><br/>
+<span style='color: #155724; font-size: 13px;'>
+Script running in: <strong>PowerShell $powerShellVersion</strong><br/>
+CPUID detection: <strong>PowerShell 7 wrapper (hardware-level accuracy)</strong><br/><br/>
+This script detected PowerShell 7 on the system and used it to perform accurate hardware-level CPUID detection via .NET 5+ intrinsics, even though the script was launched from PowerShell $powerShellVersion.
+</span>
+</div>
+</div>
+</div>
+"@
+    } else {
+        # PS5 running and PS7 not available or wrapper failed
+        $htmlOutput += @"
 <div style='padding: 15px; margin-bottom: 20px; background-color: #fff3cd; border-left: 5px solid #ff9800; border-radius: 3px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);'>
 <div style='display: flex; align-items: flex-start;'>
 <div style='font-size: 32px; margin-right: 15px; color: #ff9800;'>⚠️</div>
@@ -1030,6 +1684,7 @@ Or run: <code style='background: #eee; padding: 2px 6px; border-radius: 3px;'>wi
 </div>
 </div>
 "@
+    }
 }
 
 # ============================================================================
@@ -1114,8 +1769,9 @@ $htmlOutput += @"
 <table style='width: 100%; border-collapse: collapse; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px;'>
 <thead>
 <tr style='background-color: #16a085; color: white;'>
-<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width: 40%;'>Feature</th>
-<th style='padding: 12px; text-align: center; border: 1px solid #ddd; width: 20%;'>Status</th>
+<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width: 45%;'>Feature</th>
+<th style='padding: 12px; text-align: center; border: 1px solid #ddd; width: 20%;'>Supported</th>
+<th style='padding: 12px; text-align: center; border: 1px solid #ddd; width: 20%;'>Enabled</th>
 </tr>
 </thead>
 <tbody>
@@ -1130,11 +1786,28 @@ foreach ($feature in $sortedFeatures) {
     $featureDesc = $feature.Value
     $status = $cpuFeatures[$featureKey]
 
-    # Format status with color-coded icons
+    # Format "Supported" column with color-coded icons
     if ($status -eq "supported") {
-        $statusHtml = "<span style='color: #27ae60; font-weight: bold;'>✓ Supported</span>"
+        $supportedHtml = "<span style='color: #27ae60; font-weight: bold;'>✓ Yes</span>"
     } else {
-        $statusHtml = "<span style='color: #95a5a6;'>✗ Not Supported</span>"
+        $supportedHtml = "<span style='color: #95a5a6;'>✗ No</span>"
+    }
+
+    # Format "Enabled" column
+    # Only show enabled/disabled for features that can be toggled (VMX, SVM, Hypervisor, NX)
+    # All other features show "N/A" (not applicable - they can't be disabled)
+    if ($featureCanBeDisabled -contains $featureKey) {
+        $enabledStatus = $cpuFeaturesEnabled[$featureKey]
+        if ($enabledStatus -eq "enabled") {
+            $enabledHtml = "<span style='color: #27ae60; font-weight: bold;'>✓ Yes</span>"
+        } elseif ($enabledStatus -eq "disabled") {
+            $enabledHtml = "<span style='color: #e74c3c; font-weight: bold;'>✗ No</span>"
+        } else {
+            $enabledHtml = "<span style='color: #95a5a6;'>Unknown</span>"
+        }
+    } else {
+        # Feature cannot be disabled - it's always enabled if supported
+        $enabledHtml = "<span style='color: #95a5a6;'>N/A</span>"
     }
 
     $bgColor = if ($rowCount % 2 -eq 0) { "#f8f9fa" } else { "#ffffff" }
@@ -1142,7 +1815,8 @@ foreach ($feature in $sortedFeatures) {
     $htmlOutput += @"
 <tr style='background-color: $bgColor;'>
 <td style='padding: 10px; border: 1px solid #ddd;'>$featureDesc</td>
-<td style='padding: 10px; border: 1px solid #ddd; text-align: center;'>$statusHtml</td>
+<td style='padding: 10px; border: 1px solid #ddd; text-align: center;'>$supportedHtml</td>
+<td style='padding: 10px; border: 1px solid #ddd; text-align: center;'>$enabledHtml</td>
 </tr>
 "@
     $rowCount++
@@ -1151,6 +1825,22 @@ foreach ($feature in $sortedFeatures) {
 $htmlOutput += @"
 </tbody>
 </table>
+<div style='margin-top: 10px; padding: 12px; background-color: #f8f9fa; border-left: 4px solid #17a2b8; border-radius: 3px; font-size: 12px;'>
+<strong style='color: #17a2b8;'>* Note on "Running under Hypervisor":</strong><br/>
+<span style='color: #555;'>
+On physical Windows 10/11 PCs, this may show as "Yes" even though the machine is not a virtual machine.
+This is <strong>expected behavior</strong> when any of the following Windows features are enabled:
+<ul style='margin: 8px 0 8px 20px; padding: 0;'>
+<li>Hyper-V or Windows Hypervisor Platform</li>
+<li>Windows Sandbox</li>
+<li>WSL2 (Windows Subsystem for Linux 2)</li>
+<li>Memory Integrity / Core Isolation (HVCI)</li>
+<li>Credential Guard or Device Guard</li>
+</ul>
+When these features are active, Windows runs in a "Hyper-V root partition" mode where the OS kernel operates on top of Microsoft's hypervisor layer.
+This is a <strong>positive security indicator</strong> showing that Virtualization-Based Security (VBS) is protecting your system.
+</span>
+</div>
 "@
 
 # ============================================================================
@@ -1191,9 +1881,11 @@ $htmlOutput += @"
 <table style='width: 100%; border-collapse: collapse; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px;'>
 <thead>
 <tr style='background-color: #e74c3c; color: white;'>
-<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width: 30%;'>Vulnerability</th>
-<th style='padding: 12px; text-align: center; border: 1px solid #ddd; width: 15%;'>Status</th>
-<th style='padding: 12px; text-align: left; border: 1px solid #ddd;'>Mitigation</th>
+<th style='padding: 12px; text-align: left; border: 1px solid #ddd;'>Vulnerability</th>
+<th style='padding: 12px; text-align: left; border: 1px solid #ddd;'>CVE</th>
+<th style='padding: 12px; text-align: center; border: 1px solid #ddd;'>Disclosed</th>
+<th style='padding: 12px; text-align: center; border: 1px solid #ddd;'>Status</th>
+<th style='padding: 12px; text-align: left; border: 1px solid #ddd;'>Mitigation / Remediation</th>
 </tr>
 </thead>
 <tbody>
@@ -1207,6 +1899,12 @@ foreach ($vuln in $sortedVulns) {
     $vulnName = $vuln.Key
     $vulnStatus = $vuln.Value.Status
     $vulnMitigation = $vuln.Value.Mitigation
+
+    # Get metadata for this vulnerability (CVE, date, MS article)
+    $metadata = $vulnerabilityMetadata[$vulnName]
+    $cveNumber = if ($metadata) { $metadata.CVE } else { "N/A" }
+    $disclosureDate = if ($metadata) { $metadata.Date } else { "N/A" }
+    $msArticle = if ($metadata) { $metadata.MSArticle } else { $null }
 
     # Format status with color-coded icons
     switch ($vulnStatus) {
@@ -1224,18 +1922,46 @@ foreach ($vuln in $sortedVulns) {
         }
     }
 
-    # Truncate long mitigation strings for display
-    if ($vulnMitigation.Length -gt 100) {
-        $vulnMitigation = $vulnMitigation.Substring(0, 97) + "..."
+    # Build mitigation column content
+    # Add remediation link for vulnerable status
+    $mitigationHtml = $vulnMitigation
+    if ($vulnStatus -eq "vulnerable" -and $msArticle) {
+        $mitigationHtml += "<br/><a href='$msArticle' style='color: #2980b9; font-size: 11px;' target='_blank'>📄 Microsoft Guidance</a>"
+    }
+
+    # Truncate long mitigation strings for display (before adding link)
+    if ($vulnMitigation.Length -gt 80) {
+        $truncatedMitigation = $vulnMitigation.Substring(0, 77) + "..."
+        if ($vulnStatus -eq "vulnerable" -and $msArticle) {
+            $mitigationHtml = "$truncatedMitigation<br/><a href='$msArticle' style='color: #2980b9; font-size: 11px;' target='_blank'>📄 Microsoft Guidance</a>"
+        } else {
+            $mitigationHtml = $truncatedMitigation
+        }
     }
 
     $bgColor = if ($rowCount % 2 -eq 0) { "#f8f9fa" } else { "#ffffff" }
 
+    # Format CVE as link(s) to NIST NVD
+    $cveHtml = ""
+    if ($cveNumber -ne "N/A") {
+        $cveList = $cveNumber -split ", "
+        $cveLinks = @()
+        foreach ($cve in $cveList) {
+            $cve = $cve.Trim()
+            $cveLinks += "<a href='https://nvd.nist.gov/vuln/detail/$cve' style='color: #2980b9; font-size: 11px;' target='_blank'>$cve</a>"
+        }
+        $cveHtml = $cveLinks -join "<br/>"
+    } else {
+        $cveHtml = "<span style='color: #95a5a6;'>N/A</span>"
+    }
+
     $htmlOutput += @"
 <tr style='background-color: $bgColor;'>
-<td style='padding: 10px; border: 1px solid #ddd;'>$vulnName</td>
+<td style='padding: 10px; border: 1px solid #ddd; font-weight: bold;'>$vulnName</td>
+<td style='padding: 10px; border: 1px solid #ddd; font-size: 11px;'>$cveHtml</td>
+<td style='padding: 10px; border: 1px solid #ddd; text-align: center; font-size: 11px;'>$disclosureDate</td>
 <td style='padding: 10px; border: 1px solid #ddd; text-align: center;'>$statusHtml</td>
-<td style='padding: 10px; border: 1px solid #ddd; font-size: 11px;'>$vulnMitigation</td>
+<td style='padding: 10px; border: 1px solid #ddd; font-size: 11px;'>$mitigationHtml</td>
 </tr>
 "@
     $rowCount++
@@ -1271,7 +1997,11 @@ catch {
 
 # Show detection method used (hardware CPUID vs fallback)
 $detectionMethod = if ($cpuidViaIntrinsics) {
-    "<span style='color: #27ae60; font-weight: bold;'>✓ Dynamic CPUID (Hardware)</span>"
+    if ($usingPS7Wrapper) {
+        "<span style='color: #27ae60; font-weight: bold;'>✓ Dynamic CPUID (Hardware via PS7 Wrapper)</span>"
+    } else {
+        "<span style='color: #27ae60; font-weight: bold;'>✓ Dynamic CPUID (Hardware, Native PS7)</span>"
+    }
 } else {
     "<span style='color: #e67e22; font-weight: bold;'>⚠ Fallback Methods (API/Registry/Model-based)</span>"
 }
