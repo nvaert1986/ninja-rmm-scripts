@@ -42,45 +42,56 @@ The NinjaOne agent was designed for Debian/Ubuntu systems and calls `dpkg-query`
   ```
   emerge --ask app-portage/portage-utils
   ```
-- NinjaOne agent installed and running (`/opt/NinjaRMMAgent/`)
-
 ---
 
 ## Installation
 
-### 1. Download the scripts
+> ### ⚠️ CRITICAL — Read before deploying these wrapper scripts
+>
+> **Step 1 must be completed before these dpkg and dpkg-query wrapper scripts are installed and active.**
+>
+> The NinjaOne server records the install date for each package the very first time the agent reports it. Once recorded, **that date is permanent — the server will never update it**, even if the agent later reports a different date.
+>
+> If the agent runs its first inventory before `/var/log/dpkg.log` exists and contains correct data, it will report **1970-01-01** as the install date for every package. Correcting this afterwards requires removing and re-enrolling the device in NinjaOne entirely.
+>
+> **Always run `generate-dpkg-log` first, before deploying these wrapper scripts.**
 
-Clone or download the scripts from GitHub. The files are provided with a `.sh` extension and must be **renamed** when copied (the `.sh` extension must be removed).
+---
 
-### 2. Copy and make executable
+### Step 1. Generate the install-date log (BEFORE deploying the wrapper scripts)
+
+Script files from GitHub have a `.sh` extension that must be **removed** when copying. Copy the script, make it executable, and run it immediately:
+
+```bash
+cp generate-dpkg-log.sh /usr/local/sbin/generate-dpkg-log && chmod 755 /usr/local/sbin/generate-dpkg-log
+sudo /usr/local/sbin/generate-dpkg-log
+```
+
+Verify it produced entries before continuing:
+
+```bash
+head -5 /var/log/dpkg.log
+```
+
+You should see lines like:
+```
+2025-11-06 18:25:23 install bash:amd64 <none> 5.2.037
+```
+
+If the output is empty, do not proceed — investigate why `/var/db/pkg/` is not being parsed before deploying the wrapper scripts.
+
+---
+
+### Step 2. Copy remaining scripts and make executable
 
 Run the following as root:
 
 ```bash
-# dpkg-query wrapper
-cp dpkg-query.sh /usr/local/bin/dpkg-query
-chmod 755 /usr/local/bin/dpkg-query
-
-# dpkg wrapper
-cp dpkg.sh /usr/local/bin/dpkg
-chmod 755 /usr/local/bin/dpkg
-
-# generate-dpkg-log tool
-cp generate-dpkg-log.sh /usr/local/sbin/generate-dpkg-log
-chmod 755 /usr/local/sbin/generate-dpkg-log
+cp dpkg-query.sh /usr/local/bin/dpkg-query && chmod 755 /usr/local/bin/dpkg-query
+cp dpkg.sh       /usr/local/bin/dpkg       && chmod 755 /usr/local/bin/dpkg
 ```
 
-### 3. Generate the initial install-date log
-
-Run this once to backfill `/var/log/dpkg.log` with historical install dates derived from Portage package directory timestamps:
-
-```bash
-sudo /usr/local/sbin/generate-dpkg-log
-```
-
-This creates `/var/log/dpkg.log` which NinjaOne reads to populate the "Install date" column for each package.
-
-### 4. Set up the Portage hook for ongoing tracking
+### Step 3. Set up the Portage hook for ongoing tracking
 
 Add the following to `/etc/portage/bashrc` so that every future `emerge` automatically appends to `/var/log/dpkg.log`:
 
@@ -97,7 +108,7 @@ post_pkg_postinst() {
 
 If `/etc/portage/bashrc` does not exist yet, create it with that content.
 
-### 5. Verify
+### Step 4. Verify
 
 Test the dpkg-query wrapper directly:
 
