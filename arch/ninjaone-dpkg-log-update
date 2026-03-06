@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# ninjaone-dpkg-log-update — called by pacman hook after every transaction
+# Appends new install/upgrade/remove events to /var/log/dpkg.log
+#
+# Install: cp this file to /usr/local/sbin/ninjaone-dpkg-log-update && chmod 755 /usr/local/sbin/ninjaone-dpkg-log-update
+
+DPKG_LOG="/var/log/dpkg.log"
+PACMAN_LOG="/var/log/pacman.log"
+STATE_FILE="/var/lib/ninjaone-dpkg/last-linecount"
+PACMAN_LOCAL="/var/lib/pacman/local"
+
+mkdir -p "$(dirname "$STATE_FILE")"
+
+# Read last-processed line count; 0 = never run before
+last_count=0
+[[ -f "$STATE_FILE" ]] && last_count=$(< "$STATE_FILE")
+
+# Current total line count of pacman.log
+total_count=$(wc -l < "$PACMAN_LOG")
+
+# Nothing new — update state and exit
+if [[ "$total_count" -le "$last_count" ]]; then
+    echo "$total_count" > "$STATE_FILE"
+    exit 0
+fi
+
+# Write only the new lines to a temp file so awk can take two file inputs
+newlines_file=$(mktemp)
+pkg_arch_file=$(mktemp)
+trap 'rm -f "$newlines_file" "$pkg_arch_file"' EXIT
+
+tail -n +"$((last_count + 1))" "$PACMAN_LOG" > "$newlines_file"
+
+# Build pkg→arch lookup for currently installed packages
+awk '
+    /^%NAME%$/ { getline; name = $0; next }
+    /^%ARCH%$/ { getline; print name, $0 }
+' "$PACMAN_LOCAL"/*/desc 2>/dev/null > "$pkg_arch_file"
+
+# Parse new lines and append to dpkg.log
+awk '
+    NR == FNR {
+        pkg_arch[$1] = $2
+        next
+    }
+    $2 == "[ALPM]" && ($3 == "installed" || $3 == "upgraded" || $3 == "removed") {
+        date    = substr($1, 2, 10)
+        time    = substr($1, 13, 8)
+        pkg     = $4
+        arch    = (pkg in pkg_arch) ? pkg_arch[pkg] : "x86_64"
+        pkgfull = pkg ":" arch
+
+        if ($3 == "installed") {
+            ver = substr($5, 2, length($5) - 2)
+            print date, time, "install", pkgfull, "<none>", ver
+
+        } else if ($3 == "upgraded") {
+            oldver = substr($5, 2)
+            newver = substr($7, 1, length($7) - 1)
+            print date, time, "upgrade", pkgfull, oldver, newver
+
+        } else if ($3 == "removed") {
+            ver = substr($5, 2, length($5) - 2)
+            print date, time, "remove", pkgfull, ver, "<none>"
+        }
+    }
+' "$pkg_arch_file" "$newlines_file" >> "$DPKG_LOG"
+
+# Save new line count as the processed position marker
+echo "$total_count" > "$STATE_FILE"

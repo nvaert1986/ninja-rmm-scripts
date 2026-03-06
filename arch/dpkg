@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# dpkg compatibility wrapper for Arch Linux
+# Handles dpkg -l style queries from NinjaOne agent
+#
+# Install: cp this file to /usr/local/bin/dpkg && chmod 755 /usr/local/bin/dpkg
+
+case "$1" in
+    -l)
+        # Desired/Status/Err flags + name + version + architecture
+        pacman -Q 2>/dev/null | while IFS=' ' read -r pkg ver; do
+            printf "ii  %-40s %-20s amd64        Arch Linux package\n" "$pkg" "$ver"
+        done
+        ;;
+    --get-selections)
+        pacman -Q 2>/dev/null | awk '{print $1 "\tinstall"}'
+        ;;
+    *)
+        echo "dpkg: Arch Linux wrapper — unsupported option: $*" >&2
+        exit 1
+        ;;
+esac
