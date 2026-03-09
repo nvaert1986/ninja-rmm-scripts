@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# dpkg-query compatibility wrapper for Arch Linux / pacman-based distros
+# Provides NinjaOne agent with package inventory data
+# Supports: pacman (official repos) + yay / paru / any AUR helper
+#
+# Install: cp this file to /usr/local/bin/dpkg-query && chmod 755 /usr/local/bin/dpkg-query
+
+PACMAN_LOCAL="/var/lib/pacman/local"
+
+case "$*" in
+*"--show"*"--showformat"*)
+
+    # ── 1. Build AUR set (foreign = not in any official repo) ──
+    declare -A is_aur
+    while IFS=' ' read -r pkg _; do
+        is_aur["$pkg"]=1
+    done < <(pacman -Qm 2>/dev/null)
+
+    # ── 2. Parse architecture from all desc files in one awk pass ──
+    declare -A pkg_arch
+    while IFS=: read -r pkg arch; do
+        pkg_arch["$pkg"]="$arch"
+    done < <(awk '
+        /^%NAME%$/ { getline; name = $0; next }
+        /^%ARCH%$/ { getline; printf "%s:%s\n", name, $0 }
+    ' "$PACMAN_LOCAL"/*/desc 2>/dev/null)
+
+    # ── 3. Emit sentinel package (marks this system as wrapper-managed) ──
+    echo -e "a-arch-dpkg-wrapper:x86_64\t1.0.0\tINSTALLDATE_TEMPLATE\tarch-meta\tdpkg"
+
+    # ── 4. Emit all installed packages ──
+    # NinjaOne substitutes INSTALLDATE_TEMPLATE with the date from /var/log/dpkg.log
+    # using its own internal lookup — do not put a date value here.
+    while IFS=' ' read -r pkgname pkgver; do
+        arch="${pkg_arch[$pkgname]:-x86_64}"
+        repo=$( [[ -n "${is_aur[$pkgname]}" ]] && echo "aur" || echo "arch-official" )
+        echo -e "${pkgname}:${arch}\t${pkgver}\tINSTALLDATE_TEMPLATE\t${repo}\tdpkg"
+    done < <(pacman -Q 2>/dev/null)
+    ;;
+
+*)
+    echo "dpkg-query: Arch Linux wrapper — only --show --showformat is supported (got: $*)" >&2
+    exit 1
+    ;;
+esac

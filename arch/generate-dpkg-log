@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# generate-dpkg-log — one-time historical import for Arch Linux
+# Converts /var/log/pacman.log history into /var/log/dpkg.log format
+# Run once as root after deploying the wrappers.
+#
+# Install: cp this file to /usr/local/sbin/generate-dpkg-log && chmod 755 /usr/local/sbin/generate-dpkg-log
+# Usage:   sudo /usr/local/sbin/generate-dpkg-log
+
+set -euo pipefail
+
+DPKG_LOG="/var/log/dpkg.log"
+PACMAN_LOG="/var/log/pacman.log"
+PACMAN_LOCAL="/var/lib/pacman/local"
+
+[[ $EUID -ne 0 ]] && { echo "ERROR: must run as root" >&2; exit 1; }
+[[ -r "$PACMAN_LOG" ]] || { echo "ERROR: cannot read $PACMAN_LOG" >&2; exit 1; }
+
+echo "Parsing architecture info from local package database..."
+
+pkg_arch_file=$(mktemp)
+tmpfile=$(mktemp)
+trap 'rm -f "$pkg_arch_file" "$tmpfile"' EXIT
+
+# Build pkg→arch lookup: one line per package "pkgname arch"
+awk '
+    /^%NAME%$/ { getline; name = $0; next }
+    /^%ARCH%$/ { getline; print name, $0 }
+' "$PACMAN_LOCAL"/*/desc 2>/dev/null > "$pkg_arch_file"
+
+echo "Parsing $PACMAN_LOG..."
+
+# Parse pacman.log using awk field splitting.
+# No bash regex needed — space-delimited fields map cleanly:
+#
+#   $1 = [2025-11-06T18:25:23+0000]
+#   $2 = [ALPM]
+#   $3 = installed | upgraded | removed
+#   $4 = pkgname
+#   $5 = (version)    for installed / removed
+#   $5 = (oldver      for upgraded
+#   $6 = ->           for upgraded
+#   $7 = newver)      for upgraded
+#
+# dpkg.log output format:
+#   2025-11-06 18:25:23 install  pkgname:arch <none>  version
+#   2025-11-06 18:25:23 upgrade  pkgname:arch oldver  newver
+#   2025-11-06 18:25:23 remove   pkgname:arch version <none>
+
+awk '
+    NR == FNR {
+        pkg_arch[$1] = $2
+        next
+    }
+    $2 == "[ALPM]" && ($3 == "installed" || $3 == "upgraded" || $3 == "removed") {
+        date    = substr($1, 2, 10)
+        time    = substr($1, 13, 8)
+        pkg     = $4
+        arch    = (pkg in pkg_arch) ? pkg_arch[pkg] : "x86_64"
+        pkgfull = pkg ":" arch
+
+        if ($3 == "installed") {
+            ver = substr($5, 2, length($5) - 2)
+            print date, time, "install", pkgfull, "<none>", ver
+
+        } else if ($3 == "upgraded") {
+            # $5 = "(oldver"  $6 = "->"  $7 = "newver)"
+            oldver = substr($5, 2)
+            newver = substr($7, 1, length($7) - 1)
+            print date, time, "upgrade", pkgfull, oldver, newver
+
+        } else if ($3 == "removed") {
+            ver = substr($5, 2, length($5) - 2)
+            print date, time, "remove", pkgfull, ver, "<none>"
+        }
+    }
+' "$pkg_arch_file" "$PACMAN_LOG" > "$tmpfile"
+
+count=$(wc -l < "$tmpfile")
+echo "Parsed $count entries."
+
+if [[ -f "$DPKG_LOG" ]]; then
+    cp "$DPKG_LOG" "${DPKG_LOG}.bak"
+    echo "Backed up existing $DPKG_LOG → ${DPKG_LOG}.bak"
+fi
+
+cp "$tmpfile" "$DPKG_LOG"
+chmod 644 "$DPKG_LOG"
+echo "Written to $DPKG_LOG — done."
